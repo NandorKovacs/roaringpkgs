@@ -1,0 +1,12 @@
+# User unit (systemctl --user). Assumes the pkgs repo is checked out at
+# ~/pkgs — ExecStart relies on the %h (home dir) specifier for that path.
+[Unit]
+Description=Refresh staging repo (roaringpkgs)
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/pkgs/bin/pkgs-sync
+Nice=10
+IOSchedulingClass=idle

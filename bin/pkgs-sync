@@ -1,0 +1,141 @@
+#!/bin/bash
+# pkgs-sync — timer entry point. Refreshes the staging repo: AUR release
+# packages first, then a VCS pass that rebuilds only those VCS packages
+# whose upstream actually moved. Never touches gpg, GPG_KEY, PUBLISH_DIR,
+# or REMOTE, and never adds or removes repo members.
+#
+# The VCS pass follows aurutils' shipped examples/sync-devel: the local
+# repo's versions go to aur-vercmp on stdin, and the freshly computed
+# versions from aur-srcver are supplied with -p. Membership comes from the
+# repo database, so a package that is not already in the repo is never
+# built here — refreshing is not adding.
+set -euo pipefail
+
+PKGS_PROG=pkgs-sync
+_lib=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$_lib"
+
+pkgs_load_conf
+pkgs_require REPO_NAME STAGING_DIR CUSTOM_DIRS
+pkgs_need_cmd aur awk mktemp
+pkgs_lock -n
+
+# Where aurutils clones AUR build files (aur-sync(1): AURDEST).
+AURDEST=${AURDEST:-${XDG_CACHE_HOME:-$HOME/.cache}/aurutils/sync}
+
+# The AUR has no formal definition of a VCS package; this is the same set
+# aurutils' own examples use.
+VCS_RE='.*-(cvs|svn|git|hg|bzr|darcs)$'
+
+tmp=$(mktemp -d) || die "cannot create temporary directory"
+trap 'rm -rf "$tmp"' EXIT
+
+# A mistyped CUSTOM_DIRS entry is worth reporting rather than ignoring: a
+# locally maintained package whose directory cannot be found looks like a
+# plain AUR package below, and would be silently fetched from the AUR.
+for _d in "${CUSTOM_DIRS[@]}"; do
+    [[ -d $_d ]] || pkgs_fail "CUSTOM_DIRS entry missing: $_d"
+done
+
+## Pass 1 — AUR release packages, chroot builds.
+if ! aur sync -u -c -d "$REPO_NAME" --no-view --noconfirm; then
+    pkgs_fail "aur sync -u failed"
+fi
+
+## Pass 2 — VCS packages. Repo membership is the source of truth, so the
+## candidate list comes from the database, not from the AUR or the disk.
+if ! aur repo -d "$REPO_NAME" --list >"$tmp/db"; then
+    pkgs_fail "aur repo -d $REPO_NAME --list failed"
+    : >"$tmp/db"
+fi
+# Candidates are keyed by pkgbase, not pkgname: a split package contributes
+# several pkgnames to the database but has exactly one build directory and
+# one pkgver(). Filtering --list by name would make every non-base pkgname
+# of a split VCS package ("foo-git-docs") look like a package whose PKGBUILD
+# is missing, failing the run on every timer tick.
+if ! aur repo -d "$REPO_NAME" --field base >"$tmp/bases"; then
+    pkgs_fail "aur repo -d $REPO_NAME --field base failed"
+    : >"$tmp/bases"
+fi
+awk -v mask="$VCS_RE" '$1 ~ mask {print $1}' "$tmp/bases" | sort -u >"$tmp/vcs"
+
+# custom_dir PKGBASE — print the CUSTOM_DIRS subdirectory holding this
+# pkgbase's PKGBUILD, if any. Being in a configured custom dir is the
+# provenance: it marks the package as locally maintained rather than an
+# AUR clone, so it is never fetched from the AUR.
+custom_dir() {
+    local pkgbase=$1 d
+    for d in "${CUSTOM_DIRS[@]}"; do
+        [[ -f $d/$pkgbase/PKGBUILD ]] && { printf '%s\n' "$d/$pkgbase"; return 0; }
+    done
+    return 1
+}
+
+# srcver_into FILE DIR — append "pkgbase\tversion" for DIR. aur-srcver
+# resolves a pkgbase as a subdirectory of the working directory, so it has
+# to run from the parent. This executes the PKGBUILD's pkgver() against the
+# latest upstream checkout; it is the slow part of the run.
+srcver_into() {
+    local out=$1 dir=$2
+    (cd "${dir%/*}" && aur srcver "${dir##*/}") >>"$out" 2>/dev/null
+}
+
+declare -A pkgdir=()
+
+if [[ -s $tmp/vcs ]]; then
+    : >"$tmp/srcver"
+    while read -r pkgbase; do
+        [[ -n $pkgbase ]] || continue
+
+        if dir=$(custom_dir "$pkgbase"); then
+            :
+        else
+            # An AUR clone: refresh it so srcver sees new downstream commits.
+            dir=$AURDEST/$pkgbase
+            mkdir -p "$AURDEST"
+            if ! (cd "$AURDEST" && aur fetch -S "$pkgbase") >/dev/null 2>&1; then
+                pkgs_fail "aur fetch failed: $pkgbase"
+            fi
+        fi
+
+        if [[ ! -f $dir/PKGBUILD ]]; then
+            pkgs_fail "no PKGBUILD directory found for $pkgbase"
+            continue
+        fi
+        pkgdir[$pkgbase]=$dir
+
+        if ! srcver_into "$tmp/srcver" "$dir"; then
+            pkgs_fail "aur srcver failed: $pkgbase"
+        fi
+    done <"$tmp/vcs"
+
+    # aur-vercmp reads the repo's versions on stdin and the candidate
+    # versions from -p, printing "pkgname old -> new" for each package the
+    # candidate file has newer. Anything else means no rebuild is needed.
+    if [[ -s $tmp/srcver ]]; then
+        aur vercmp -p "$tmp/srcver" <"$tmp/db" >"$tmp/cmp" || true
+        awk '{print $1}' "$tmp/cmp" >"$tmp/ood"
+
+        while read -r pkgbase; do
+            [[ -n $pkgbase ]] || continue
+            dir=${pkgdir[$pkgbase]-}
+            if [[ -z $dir ]]; then
+                pkgs_fail "no PKGBUILD directory found for $pkgbase"
+                continue
+            fi
+            if ! (cd "$dir" && aur build -c -d "$REPO_NAME" --noconfirm); then
+                pkgs_fail "build failed: $pkgbase"
+            fi
+        done <"$tmp/ood"
+    fi
+fi
+
+# Note: custom (non-AUR) VCS packages need no separate pass. They appear in
+# the repo listing above like any other member, and custom_dir() resolves
+# them to their working directory instead of an AUR clone. A custom package
+# that is not yet in the repo is deliberately not built: adding members is
+# a manual step (aur build -c -d "$REPO_NAME"), never the timer's job.
+# Non-VCS custom packages are never rebuilt automatically at all.
+
+pkgs_fail_report

@@ -1,0 +1,128 @@
+#!/bin/bash
+# pkgs-remove — repo-remove a package from the staging db, then delete its
+# package files from staging. Proposal §3: "the one wrapper that earns its
+# existence", because removal genuinely takes two coordinated steps.
+#
+# Usage: pkgs-remove [-n] PKGNAME...
+#   -n, --help  see usage() below
+set -euo pipefail
+
+PKGS_PROG=pkgs-remove
+_lib=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$_lib"
+
+usage() {
+    cat <<'EOF'
+usage: pkgs-remove [-n] [-h] PKGNAME...
+
+Remove one or more packages from the staging repo: repo-remove from the db,
+then delete their package files (and detached sigs, if present) from
+STAGING_DIR. Blocks (waits) on the staging lock rather than skipping, since
+this is a manual, mutating operation and must not race the sync timer.
+
+  -n, --dry-run   echo the repo-remove/rm commands instead of running them
+  -h, --help      show this help
+
+Only the staging repo is touched here — PUBLISH_DIR, gpg, and REMOTE are
+never involved. The removal reaches the server on the next pkgs-publish,
+which prunes anything no longer present in staging.
+
+If PKGNAME was a custom package (built from a directory under a
+CUSTOM_DIRS entry), that source directory is NOT deleted by this script —
+remove it by hand.
+EOF
+}
+
+# Accept --help as a bare first argument; getopts below only understands
+# the short form.
+if [[ ${1-} == --help ]]; then
+    usage
+    exit 0
+fi
+
+DRY_RUN=0
+while getopts ':nh' opt; do
+    case $opt in
+        n) DRY_RUN=1 ;;
+        h) usage; exit 0 ;;
+        *) usage >&2; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+if (($# == 0)); then
+    usage >&2
+    die "no package names given"
+fi
+
+# run CMD... — execute, or under -n just echo what would run.
+run() {
+    if ((DRY_RUN)); then
+        printf '+ %s\n' "$*" >&2
+    else
+        "$@"
+    fi
+}
+
+pkgs_load_conf
+pkgs_require REPO_NAME STAGING_DIR
+pkgs_need_cmd repo-remove
+
+[[ -d $STAGING_DIR ]] || die "staging dir does not exist: $STAGING_DIR"
+
+# Manual, interactive mutation of the staging db — block until any
+# concurrent timer sync releases the lock rather than silently no-op'ing
+# (that -n/nonblock behavior belongs to pkgs-sync, not here).
+pkgs_lock
+
+# repo-remove is all-or-nothing across its argument list: given one name it
+# cannot find, it reports an error and leaves the database completely
+# unmodified. Passing all names at once would therefore turn a single typo
+# into a silent no-op — or, worse, delete the files of the valid packages
+# while their db entries survived. So remove one package at a time and tie
+# each file deletion to its own db removal succeeding.
+for pkg in "$@"; do
+    removed=0
+
+    if ! run repo-remove "$(pkgs_db)" "$pkg"; then
+        pkgs_fail "$pkg: not removed from the db; leaving its files alone"
+        continue
+    fi
+
+    # Candidate files: anything starting with "$pkg-". A real pacman
+    # package filename has the shape NAME-VERSION-REL-ARCH.pkg.tar.zst
+    # (plus an optional .sig), where VERSION and REL always start with a
+    # digit — pkgver/pkgrel cannot start with anything else. So after
+    # stripping the "$pkg-" prefix, what remains must itself look like
+    # VERSION-REL-ARCH.pkg.tar.<ext>[.sig] with both VERSION and REL
+    # digit-led. This rejects a same-prefixed but different package: e.g.
+    # removing "foo" must not also delete
+    # "foo-bin-1.0-1-x86_64.pkg.tar.zst" (a package literally named
+    # "foo-bin"), because after stripping "foo-" the remainder starts
+    # with "bin-", not a digit.
+    # .xz is matched as well as .zst: an old prebuilt drop in staging may
+    # still use it, and pkgs-publish handles both — leaving one behind here
+    # would orphan a file that publish then re-ships.
+    shopt -s nullglob
+    candidates=("$STAGING_DIR/$pkg"-*.pkg.tar.zst "$STAGING_DIR/$pkg"-*.pkg.tar.zst.sig
+                "$STAGING_DIR/$pkg"-*.pkg.tar.xz "$STAGING_DIR/$pkg"-*.pkg.tar.xz.sig)
+    shopt -u nullglob
+
+    for f in "${candidates[@]}"; do
+        base=${f##*/}
+        rest=${base#"$pkg"-}
+        [[ $rest =~ ^[0-9][^/-]*-[0-9][^/-]*-[^/-]+\.pkg\.tar\.(zst|xz)(\.sig)?$ ]] || continue
+        run rm -f "$f"
+        removed=$((removed + 1))
+    done
+
+    if ((removed == 0)); then
+        warn "no package files found in $STAGING_DIR for $pkg"
+    else
+        msg "removed $removed file(s) for $pkg from $STAGING_DIR"
+    fi
+done
+
+# Non-zero exit if any package could not be removed from the db.
+pkgs_fail_report

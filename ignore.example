@@ -1,0 +1,14 @@
+# aurutils sync ignore list — install as
+# ~/.config/aurutils/sync/ignore
+#
+# One entry per line. `aur sync -u` skips these packages, so they stay at
+# whatever version is currently in the repo.
+#
+# This is ONLY needed for a pinned old version of a package that also
+# exists in the AUR. Packages that are not in the AUR at all (prebuilt
+# drops, your own customs) are skipped automatically — do not list them.
+#
+# Entries may be bare package names or repo-qualified:
+#
+#   electron25
+#   roaring/electron25

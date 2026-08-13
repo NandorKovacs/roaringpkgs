@@ -1,0 +1,29 @@
+# pkgs.conf — machine-local configuration for the pkgs-* scripts.
+#
+# Install as ~/.config/pkgs/pkgs.conf (or point PKGS_CONF at it).
+# This file is sourced by bash; it holds every machine-specific path.
+# Nothing here belongs in the git repo.
+
+# Name of the pacman repository. Must match the section name in
+# /etc/pacman.conf and in /etc/aurutils/pacman-$REPO_NAME.conf.
+REPO_NAME=roaring
+
+# Unsigned staging repo. Built into by the timer; declared in
+# /etc/pacman.conf as `Server = file://$STAGING_DIR`. Never signed.
+STAGING_DIR=/srv/pkgrepo/staging/$REPO_NAME
+
+# Signed publish repo. Written by pkgs-publish only, then rsynced.
+PUBLISH_DIR=/srv/pkgrepo/publish/$REPO_NAME
+
+# Directories whose immediate subdirectories each contain a PKGBUILD
+# (your own and non-AUR VCS packages). Being in one of these dirs is
+# the provenance — there is no other bookkeeping.
+CUSTOM_DIRS=(
+    "$HOME/pkgwork/custom"
+)
+
+# Signing key. Read by pkgs-publish only; the timer path never sees it.
+GPG_KEY=0xDEADBEEFDEADBEEF
+
+# rsync destination for the published repo (last step of pkgs-publish).
+REMOTE=server.lan:/srv/pkgrepo/$REPO_NAME
