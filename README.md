@@ -204,8 +204,19 @@ performed by the scripts themselves.
 
    ```
    # /etc/sudoers.d/pkgs   (install with: sudo visudo -f /etc/sudoers.d/pkgs)
-   pkgsbuild ALL=(root) NOPASSWD: /usr/bin/mkarchroot, /usr/bin/arch-nspawn, /usr/bin/makechrootpkg
+   pkgsbuild ALL=(root) NOPASSWD: /usr/bin/mkarchroot, /usr/bin/arch-nspawn, SETENV: /usr/bin/makechrootpkg
    ```
+
+   **`SETENV:` is required, not decoration.** `aur build` invokes
+   `sudo PKGDEST=… makechrootpkg …`, and sudoers refuses command-line
+   environment variables unless the rule is tagged `SETENV` — the build
+   dies with *"sorry, you are not allowed to set the following environment
+   variables: PKGDEST"*. This never shows up when you build by hand,
+   because sudo implies `SETENV` for rules that permit `ALL` commands, and
+   a plain wheel entry is one. Tags apply to the command they precede and
+   to everything after it, so written this way only `makechrootpkg` gets
+   it; if another helper ever hits the same error, move `SETENV:` to the
+   front of the list.
 
    **Caveat, stated honestly (proposal §4):** NOPASSWD on
    `arch-nspawn`/`makechrootpkg` is effectively root-equivalent — both can

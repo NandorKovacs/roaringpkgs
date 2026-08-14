@@ -86,6 +86,9 @@ Privilege split — the timer is a **system** unit (`systemctl`, not
 - Sudoers NOPASSWD for `mkarchroot`, `arch-nspawn`, `makechrootpkg` is
   granted to `pkgsbuild`, never to a human login (root-equivalent —
   documented caveat, don't widen it, don't hand it back to the user).
+  `makechrootpkg` additionally needs the `SETENV` tag: `aur build` runs it
+  as `sudo PKGDEST=… makechrootpkg …`, and a restricted rule (unlike a
+  wheel `ALL` rule) does not imply `SETENV`. Don't drop it.
 - Both accounts are in group `pkgs`, and `STAGING_DIR`, `PUBLISH_DIR` and
   the `CUSTOM_DIRS` trees are group-owned, setgid group-writable (`2775`).
   Manual commands (`aur sync`, `aur build`, `pkgs-remove`, `pkgs-publish`)
