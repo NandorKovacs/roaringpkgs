@@ -11,4 +11,7 @@
 # Entries may be bare package names or repo-qualified:
 #
 #   electron25
-#   roaring/electron25
+#   roaring-staging/electron25
+#
+# A repo-qualified entry names the STAGING repo (REPO_NAME) — that is the
+# repo `aur sync -u` operates on. Not the published name (PUBLISH_NAME).

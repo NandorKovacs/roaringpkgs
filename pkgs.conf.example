@@ -4,9 +4,20 @@
 # This file is sourced by bash; it holds every machine-specific path.
 # Nothing here belongs in the git repo.
 
-# Name of the pacman repository. Must match the section name in
-# /etc/pacman.conf and in /etc/aurutils/pacman-$REPO_NAME.conf.
-REPO_NAME=roaring
+# Name of the STAGING repository — the build-side name. Must match the
+# section name in /etc/pacman.conf and both the filename and the section
+# of /etc/aurutils/pacman-$REPO_NAME.conf. aurutils resolves `-d
+# $REPO_NAME` to it, so this is what `aur sync`/`aur build` write into.
+REPO_NAME=roaring-staging
+
+# Name of the PUBLISHED repository — what clients see, and the db filename
+# pkgs-publish writes into PUBLISH_DIR. It is deliberately NOT the same as
+# REPO_NAME: pacman derives a repo's db filename from its pacman.conf
+# section name, so the builder desktop — which has both repos declared —
+# cannot give them one name. Staging is an internal build detail, so the
+# published repo is the one that gets the good name.
+# Defaults to REPO_NAME when unset.
+PUBLISH_NAME=roaring
 
 # Unsigned staging repo. Built into by the timer; declared in
 # /etc/pacman.conf as `Server = file://$STAGING_DIR`. Never signed.

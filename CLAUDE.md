@@ -33,10 +33,18 @@ ignore.example      # template for ~/.config/aurutils/sync/ignore
   locking, logging) can live in a sourced `lib/common.sh` if duplication
   warrants it.
 - Every script sources `${PKGS_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/pkgs/pkgs.conf}`
-  and takes ALL machine paths from it: `REPO_NAME`, `STAGING_DIR`,
-  `PUBLISH_DIR`, `CUSTOM_DIRS` (array of dirs whose subdirs hold PKGBUILDs),
-  `GPG_KEY`, `REMOTE`. Never hardcode paths; never write machine paths,
-  package sources, or built packages into this git repo.
+  and takes ALL machine paths from it: `REPO_NAME`, `PUBLISH_NAME`,
+  `STAGING_DIR`, `PUBLISH_DIR`, `CUSTOM_DIRS` (array of dirs whose subdirs
+  hold PKGBUILDs), `GPG_KEY`, `REMOTE`. Never hardcode paths; never write
+  machine paths, package sources, or built packages into this git repo
+  (`pkgs.conf` itself is gitignored).
+- Staging and published are two differently-named pacman repos, because
+  pacman derives a repo's db filename from its `pacman.conf` section name
+  and the builder desktop declares both. `REPO_NAME` (e.g.
+  `roaring-staging`) is the build side — aurutils `-d`, the chroot conf
+  filename, the staging db filename. `PUBLISH_NAME` (e.g. `roaring`) is
+  what clients see and the only name `pkgs-publish` writes. Do not collapse
+  them; do not use `REPO_NAME` for anything under `PUBLISH_DIR`.
 - All mutating operations flock `$STAGING_DIR/.lock` (non-blocking in the
   timer path: `flock -n 9 || exit 0`).
 - All builds use chroots: `aur sync -c` / `aur build -c -d $REPO_NAME`.

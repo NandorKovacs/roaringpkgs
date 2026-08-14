@@ -48,6 +48,13 @@ run() {
 
 pkgs_load_conf
 pkgs_require REPO_NAME STAGING_DIR PUBLISH_DIR GPG_KEY REMOTE
+# The published repo carries its own name. pacman derives a repo's db
+# filename from its pacman.conf section name, and the builder desktop has
+# both repos declared, so they cannot share one: REPO_NAME is the
+# staging/aurutils side, PUBLISH_NAME is what clients see. Nothing else in
+# this script touches REPO_NAME — staging is read by filename, not by db.
+# Defaulting keeps configs predating the split working.
+: "${PUBLISH_NAME:=$REPO_NAME}"
 pkgs_need_cmd gpg repo-add rsync cmp
 
 [[ -d $STAGING_DIR ]] || die "staging dir does not exist: $STAGING_DIR"
@@ -109,6 +116,16 @@ done
 
 # --- Step 2: prune packages/sigs no longer in staging ------------------
 
+# Interrupting gpg above (Ctrl-C at the pinentry prompt, say) kills this
+# script before its `rm -f "$tmp"` runs, leaving a zero-byte .sig.tmp.PID
+# behind. The package/sig prune below never matches those, so without this
+# they accumulate and get rsynced to the server forever.
+shopt -s nullglob
+for stale in "$PUBLISH_DIR"/*.sig.tmp.*; do
+    run rm -f "$stale"
+done
+shopt -u nullglob
+
 shopt -s nullglob
 published_pkgs=("$PUBLISH_DIR"/*.pkg.tar.zst "$PUBLISH_DIR"/*.pkg.tar.xz)
 shopt -u nullglob
@@ -142,7 +159,7 @@ pkgs_fail_report || die "aborting before db rebuild due to signing failures abov
 
 # Remove stale db/files artifacts before the rebuild — rebuild is always
 # from scratch, never incremental.
-run rm -f "$PUBLISH_DIR/$REPO_NAME".db* "$PUBLISH_DIR/$REPO_NAME".files*
+run rm -f "$PUBLISH_DIR/$PUBLISH_NAME".db* "$PUBLISH_DIR/$PUBLISH_NAME".files*
 
 # --- Step 3: rebuild the publish db from scratch ------------------------
 
@@ -151,7 +168,7 @@ publish_pkgs=("$PUBLISH_DIR"/*.pkg.tar.zst "$PUBLISH_DIR"/*.pkg.tar.xz)
 shopt -u nullglob
 
 if ((${#publish_pkgs[@]} > 0)); then
-    if ! run repo-add -s -v -k "$GPG_KEY" "$PUBLISH_DIR/$REPO_NAME.db.tar.gz" "${publish_pkgs[@]}"; then
+    if ! run repo-add -s -v -k "$GPG_KEY" "$PUBLISH_DIR/$PUBLISH_NAME.db.tar.gz" "${publish_pkgs[@]}"; then
         die "repo-add failed; aborting before rsync"
     fi
 else

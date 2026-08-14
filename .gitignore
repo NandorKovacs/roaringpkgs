@@ -1,1 +1,5 @@
 .omc
+
+# Machine-local config: paths, key id, rsync target. Never commit it —
+# pkgs.conf.example is the template that belongs in git.
+pkgs.conf
