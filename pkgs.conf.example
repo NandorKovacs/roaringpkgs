@@ -1,8 +1,16 @@
 # pkgs.conf — machine-local configuration for the pkgs-* scripts.
 #
-# Install as ~/.config/pkgs/pkgs.conf (or point PKGS_CONF at it).
+# Install as /etc/pkgs/pkgs.conf (root-owned, mode 644). Two accounts read
+# it: the build user runs pkgs-sync from the system timer, you run
+# pkgs-publish. A per-account ~/.config/pkgs/pkgs.conf still wins if it
+# exists, and $PKGS_CONF beats both — that is the throwaway-repo test path.
+#
 # This file is sourced by bash; it holds every machine-specific path.
 # Nothing here belongs in the git repo.
+#
+# Because two different accounts source it, write absolute paths only:
+# `$HOME`/`~` would expand to the build user's home under the timer and to
+# yours everywhere else, silently splitting the setup in two.
 
 # Name of the STAGING repository — the build-side name. Must match the
 # section name in /etc/pacman.conf and both the filename and the section
@@ -19,22 +27,29 @@ REPO_NAME=roaring-staging
 # Defaults to REPO_NAME when unset.
 PUBLISH_NAME=roaring
 
-# Unsigned staging repo. Built into by the timer; declared in
-# /etc/pacman.conf as `Server = file://$STAGING_DIR`. Never signed.
-STAGING_DIR=/srv/pkgrepo/staging/$REPO_NAME
+# Unsigned staging repo; declared in /etc/pacman.conf as
+# `Server = file://$STAGING_DIR`. Never signed. Holds $REPO_NAME.db.tar.gz —
+# the repo's name lives in that filename, not in this directory's name.
+STAGING_DIR=/srv/pkgrepo/staging
 
 # Signed publish repo. Written by pkgs-publish only, then rsynced.
-PUBLISH_DIR=/srv/pkgrepo/publish/$REPO_NAME
+PUBLISH_DIR=/srv/pkgrepo/publish
 
 # Directories whose immediate subdirectories each contain a PKGBUILD
 # (your own and non-AUR VCS packages). Being in one of these dirs is
 # the provenance — there is no other bookkeeping.
 CUSTOM_DIRS=(
-    "$HOME/pkgwork/custom"
+    "/srv/pkgrepo/custom"
 )
 
-# Signing key. Read by pkgs-publish only; the timer path never sees it.
+# All three of the above are group-owned by the shared group (setgid, mode
+# 2775) and must live outside your home directory, which the build user
+# cannot traverse.
+
+# Signing key. Read by pkgs-publish only, which you run yourself — the build
+# user has no key, and the timer path never invokes gpg.
 GPG_KEY=0xDEADBEEFDEADBEEF
 
 # rsync destination for the published repo (last step of pkgs-publish).
-REMOTE=server.lan:/srv/pkgrepo/$REPO_NAME
+# Uses your ssh credentials, since pkgs-publish is the manual half.
+REMOTE=server.lan:/srv/roaring

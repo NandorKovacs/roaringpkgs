@@ -1,4 +1,6 @@
-# User unit (systemctl --user). Pairs with pkgs-sync.service.
+# System unit (systemctl, NOT --user). Pairs with pkgs-sync.service.
+# Being a system timer, it needs no `loginctl enable-linger`: it fires
+# whether or not anyone is logged in.
 [Unit]
 Description=Daily staging repo refresh (roaringpkgs)
 

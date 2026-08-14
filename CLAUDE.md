@@ -24,16 +24,19 @@ bin/pkgs-sync       # timer entry point: aur sync -u -c, then VCS srcver pass
 bin/pkgs-publish    # manual: sign staged pkgs, rebuild signed db, rsync to server
 bin/pkgs-remove     # repo-remove + delete pkg files from staging
 lib/common.sh       # sourced helpers: config, lock, logging, failure aggregation
-systemd/            # user-level pkgs-sync.service + .timer (Persistent=true)
-pkgs.conf.example   # template for ~/.config/pkgs/pkgs.conf
-ignore.example      # template for ~/.config/aurutils/sync/ignore
+systemd/            # SYSTEM pkgs-sync.service + .timer, User=pkgsbuild
+pkgs.conf.example   # template for /etc/pkgs/pkgs.conf
+ignore.example      # template for the build user's aurutils sync/ignore
 ```
 
 - Scripts are bash, `set -euo pipefail`. Shared helpers (config loading,
   locking, logging) can live in a sourced `lib/common.sh` if duplication
   warrants it.
-- Every script sources `${PKGS_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/pkgs/pkgs.conf}`
-  and takes ALL machine paths from it: `REPO_NAME`, `PUBLISH_NAME`,
+- Every script sources the first config that exists out of `$PKGS_CONF`,
+  `$XDG_CONFIG_HOME/pkgs/pkgs.conf`, `/etc/pkgs/pkgs.conf` — the system
+  path is the real one, because two accounts read it (build user, you).
+  Config values must be absolute: `$HOME` expands differently per account.
+  Scripts take ALL machine paths from it: `REPO_NAME`, `PUBLISH_NAME`,
   `STAGING_DIR`, `PUBLISH_DIR`, `CUSTOM_DIRS` (array of dirs whose subdirs
   hold PKGBUILDs), `GPG_KEY`, `REMOTE`. Never hardcode paths; never write
   machine paths, package sources, or built packages into this git repo
@@ -75,11 +78,27 @@ ignore.example      # template for ~/.config/aurutils/sync/ignore
 ## Environment assumptions
 
 Arch Linux; `aurutils`, `devtools`, `pacman`, `git`, `gnupg`, `rsync`,
-`flock` installed. Sudoers NOPASSWD for `mkarchroot`, `arch-nspawn`,
-`makechrootpkg` (required by the unattended timer; root-equivalent —
-documented caveat, don't widen it). Timer runs as the regular user
-(`systemctl --user`, linger enabled), not root: paru-era assumptions about
-a dedicated `builder` user no longer apply.
+`flock` installed.
+
+Privilege split — the timer is a **system** unit (`systemctl`, not
+`--user`) running as a dedicated unprivileged account, `pkgsbuild`:
+
+- Sudoers NOPASSWD for `mkarchroot`, `arch-nspawn`, `makechrootpkg` is
+  granted to `pkgsbuild`, never to a human login (root-equivalent —
+  documented caveat, don't widen it, don't hand it back to the user).
+- Both accounts are in group `pkgs`, and `STAGING_DIR`, `PUBLISH_DIR` and
+  the `CUSTOM_DIRS` trees are group-owned, setgid group-writable (`2775`).
+  Manual commands (`aur sync`, `aur build`, `pkgs-remove`, `pkgs-publish`)
+  run as the user, with ordinary password-prompting sudo; only the timer
+  runs as `pkgsbuild`. The unit sets `UMask=0002`.
+- The gpg key and the ssh credentials stay with the user: `pkgsbuild` has
+  neither, and the timer path never invokes gpg.
+- Nothing the build user needs may live under a home directory (`0700` on
+  Arch): checkout at `/opt/pkgs`, config at `/etc/pkgs/pkgs.conf`, repos
+  under `/srv`. The aurutils ignore file is the exception — it must be the
+  build user's own copy, since the timer's `aur sync -u` reads it.
+- Locks are opened read-only when the lock file exists, so a
+  differently-owned lock never blocks another account.
 
 ## Testing changes
 

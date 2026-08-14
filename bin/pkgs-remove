@@ -75,6 +75,7 @@ pkgs_need_cmd repo-remove
 # concurrent timer sync releases the lock rather than silently no-op'ing
 # (that -n/nonblock behavior belongs to pkgs-sync, not here).
 pkgs_lock
+pkgs_need_staging_write
 
 # repo-remove is all-or-nothing across its argument list: given one name it
 # cannot find, it reports an error and leaves the database completely

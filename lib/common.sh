@@ -16,12 +16,27 @@ die() {
 }
 
 # pkgs_load_conf — source the machine config. All paths come from here.
+#
+# Lookup order: $PKGS_CONF, the calling account's own config dir, then the
+# system config. The system path is what lets one config serve two
+# accounts: pkgs-sync runs as the dedicated build user (timer), while
+# pkgs-publish runs as you, and both must agree on REPO_NAME/STAGING_DIR.
+# A per-user file still wins, so a throwaway test config needs no root.
 pkgs_load_conf() {
-    local conf="${PKGS_CONF:-${XDG_CONFIG_HOME:-$HOME/.config}/pkgs/pkgs.conf}"
-    [[ -f $conf ]] || die "config not found: $conf"
-    # shellcheck disable=SC1090
-    . "$conf" || die "failed to source config: $conf"
-    PKGS_CONF_PATH=$conf
+    local conf candidates
+    if [[ -n ${PKGS_CONF-} ]]; then
+        candidates=("$PKGS_CONF")
+    else
+        candidates=("${XDG_CONFIG_HOME:-${HOME-}/.config}/pkgs/pkgs.conf" /etc/pkgs/pkgs.conf)
+    fi
+    for conf in "${candidates[@]}"; do
+        [[ -f $conf ]] || continue
+        # shellcheck disable=SC1090
+        . "$conf" || die "failed to source config: $conf"
+        PKGS_CONF_PATH=$conf
+        return 0
+    done
+    die "config not found: ${candidates[*]}"
 }
 
 # pkgs_require VAR... — fail unless each named variable is set and non-empty.
@@ -47,11 +62,20 @@ pkgs_db() { printf '%s/%s.db.tar.gz\n' "$STAGING_DIR" "$REPO_NAME"; }
 # pkgs_lock [-n] — serialize mutating operations on the staging dir.
 # -n: non-blocking; exit 0 (silently) if another run holds the lock.
 # The lock fd (9) stays open for the lifetime of the process.
+#
+# An existing lock file is opened read-only: the staging repo belongs to the
+# build user, pkgs-publish runs as you, and flock(2) needs no write access.
+# Opening it for writing would make the publish path depend on the lock
+# file's mode, which nothing else here depends on.
 pkgs_lock() {
     local nonblock=0
     [[ ${1-} == -n ]] && nonblock=1
     [[ -d $STAGING_DIR ]] || die "staging dir does not exist: $STAGING_DIR"
-    exec 9>"$STAGING_DIR/.lock" || die "cannot open lock: $STAGING_DIR/.lock"
+    if [[ -e $STAGING_DIR/.lock ]]; then
+        exec 9<"$STAGING_DIR/.lock" || die "cannot open lock: $STAGING_DIR/.lock"
+    else
+        exec 9>"$STAGING_DIR/.lock" || die "cannot create lock: $STAGING_DIR/.lock"
+    fi
     if ((nonblock)); then
         flock -n 9 || exit 0
     else
@@ -75,6 +99,15 @@ pkgs_fail_report() {
         printf '%s:   %s\n' "$PKGS_PROG" "$f" >&2
     done
     return 1
+}
+
+# pkgs_need_staging_write — fail early unless this account may write the
+# staging repo. Ownership is the build user's; your login gets there through
+# the shared group. Without this check a wrong-account run dies somewhere
+# deep inside aurutils or repo-remove instead of on line one.
+pkgs_need_staging_write() {
+    [[ -w $STAGING_DIR ]] \
+        || die "$STAGING_DIR is not writable by $(id -un): run this as the build user (see README)"
 }
 
 # pkgs_need_cmd CMD... — fail unless each command is on PATH.

@@ -1,5 +1,10 @@
-# User unit (systemctl --user). Assumes the pkgs repo is checked out at
-# ~/pkgs — ExecStart relies on the %h (home dir) specifier for that path.
+# System unit (systemctl, NOT --user): the sync runs as the dedicated build
+# account, so the NOPASSWD sudoers rule the chroot helpers need belongs to
+# that account and not to a human login.
+#
+# Assumes the build user pkgsbuild in group pkgs, this repo checked out at
+# /opt/pkgs, and the shared config at /etc/pkgs/pkgs.conf — see the README.
+# Any of the three can be overridden with `systemctl edit pkgs-sync.service`.
 [Unit]
 Description=Refresh staging repo (roaringpkgs)
 Wants=network-online.target
@@ -7,6 +12,18 @@ After=network-online.target
 
 [Service]
 Type=oneshot
-ExecStart=%h/pkgs/bin/pkgs-sync
+User=pkgsbuild
+Group=pkgs
+Environment=PKGS_CONF=/etc/pkgs/pkgs.conf
+ExecStart=/opt/pkgs/bin/pkgs-sync
+
+# Keep everything the timer creates group-writable: the repos and the custom
+# PKGBUILD dirs are shared with your own account through the pkgs group.
+UMask=0002
+
+# No sandboxing knobs on purpose: NoNewPrivileges= would break the build
+# outright (the chroot helpers are reached through setuid sudo), and the
+# Protect*= family conflicts with systemd-nspawn's own mount setup. The
+# isolation here is the unprivileged account plus the build chroot.
 Nice=10
 IOSchedulingClass=idle

@@ -3,9 +3,10 @@
 aurutils is the engine that builds and maintains the repo; these scripts
 just automate the two things worth automating (unattended sync, and the
 sign+publish step) and add the one wrapper removal genuinely needs. Packages
-build unsigned into a staging repo on the desktop, then get manually signed
-and rsynced to an always-on LAN server that serves them as a dumb static
-mirror. This git repo holds only the tooling — scripts, systemd units, and
+build unsigned into a staging repo on the desktop — under a dedicated
+unprivileged build account, driven by a system timer — then get manually
+signed by you and rsynced to an always-on LAN server that serves them as a
+dumb static mirror. This git repo holds only the tooling — scripts, systemd units, and
 config templates — never machine paths, package sources, or built packages.
 
 Full design rationale: `proposalaurutils.md` (authoritative; `spec.md`, if
@@ -22,10 +23,24 @@ lib/
   common.sh       shared helpers (config loading, locking, logging) — sourced,
                   never executed directly
 systemd/
-  pkgs-sync.service / pkgs-sync.timer     user-level units (Persistent=true)
-pkgs.conf.example                          template for ~/.config/pkgs/pkgs.conf
-ignore.example                             template for ~/.config/aurutils/sync/ignore
+  pkgs-sync.service / pkgs-sync.timer     system units, run as the build user
+pkgs.conf.example                          template for /etc/pkgs/pkgs.conf
+ignore.example                             template for the build user's
+                                           ~/.config/aurutils/sync/ignore
 ```
+
+### The build user
+
+Unattended chroot builds need passwordless `sudo` for
+`mkarchroot`/`arch-nspawn`/`makechrootpkg`, which is root-equivalent. So the
+timer doesn't run as you: it's a **system** unit running as a dedicated
+account, `pkgsbuild`, and that account gets the NOPASSWD rule. Your login
+keeps ordinary password-prompting `sudo`.
+
+Both accounts belong to a shared group, `pkgs`, and every directory they
+share — staging, publish, and the custom PKGBUILD dirs — is group-owned and
+group-writable. So you keep working exactly as before: `aur sync -c foo`,
+`pkgs-remove`, `pkgs-publish` all run as you.
 
 ### Two repos, two names
 
@@ -61,30 +76,53 @@ performed by the scripts themselves.
    cd aurutils && makepkg -si
    ```
 
-2. **Create the staging and publish dirs and an empty staging db**
-   (proposal §2). Both must be owned by *your* user, not root: the timer
-   runs as you (`systemctl --user`), and everything that writes there —
-   `aur sync`/`repo-add` adding packages, the `.lock` file the scripts
-   flock, and `pkgs-publish` creating and filling the publish dir — runs
-   unprivileged. Only the `/srv` parent needs root to create.
+2. **Create the shared group and the build user.** The build account is a
+   system account nobody logs into; it needs a home only because aurutils
+   keeps its AUR clones (`$AURDEST`) and its ignore file there.
 
    ```sh
-   sudo install -d -o "$USER" -g "$(id -gn)" \
-       /srv/pkgrepo/staging /srv/pkgrepo/publish
-   repo-add /srv/pkgrepo/staging/roaring-staging.db.tar.gz
+   sudo groupadd pkgs
+   sudo useradd --system --gid pkgs --create-home \
+       --home-dir /var/lib/pkgsbuild --shell /usr/bin/bash pkgsbuild
+   sudo usermod -aG pkgs "$USER"
+   sudo chmod 750 /var/lib/pkgsbuild    # group-readable, so you can look inside
    ```
+
+   Log out and back in (or `newgrp pkgs`) before the group membership takes
+   effect in your session; `id -nG` is the check. Rename either the group or
+   the account freely — they appear in the sudoers file, the unit's
+   `User=`/`Group=`, and the commands below, but nowhere in the scripts.
+
+3. **Create the staging, publish, and custom dirs and an empty staging db**
+   (proposal §2). All three are group-owned and group-writable, setgid so
+   that everything created inside keeps the `pkgs` group:
+
+   ```sh
+   sudo install -d -o pkgsbuild -g pkgs -m 2775 \
+       /srv/pkgrepo/staging /srv/pkgrepo/publish /srv/pkgrepo/custom
+   (umask 002; repo-add /srv/pkgrepo/staging/roaring-staging.db.tar.gz)
+   ```
+
+   Both accounts write all three: the timer builds into staging and rebuilds
+   VCS packages in place in the custom dirs, while you add packages, remove
+   them, and publish. Creating and deleting files is governed by the
+   directory's permissions, not the files', so it doesn't matter which
+   account owns any given file. Use `umask 002` when you work in these dirs
+   (the unit sets it for the timer) so what you create stays group-writable.
 
    The db filename is what gives the staging repo its name — `repo-add`
    takes it from there, and so does pacman. Nothing inside the db records
    it, which is why renaming a repo later is just a matter of renaming
    these files (see "Renaming an existing repo" below).
 
-   (Run `repo-add` as your user, so the db it creates is yours too.) Any
-   other location works just as well — these paths are only the defaults in
-   `pkgs.conf.example`; set `STAGING_DIR`/`PUBLISH_DIR` to whatever you
-   used.
+   Any other location works just as well — these paths are only the
+   defaults in `pkgs.conf.example`; set `STAGING_DIR`/`PUBLISH_DIR`/
+   `CUSTOM_DIRS` to whatever you used. One constraint is real, though:
+   nothing the build user needs may live **inside your home directory**,
+   which Arch creates mode `0700` (`HOME_MODE` in `/etc/login.defs`) and
+   which the build user therefore cannot even traverse.
 
-3. **Declare the staging repo in `/etc/pacman.conf`**, so aurutils can find
+4. **Declare the staging repo in `/etc/pacman.conf`**, so aurutils can find
    it and resolve dependencies against it — but *not* so your desktop
    installs from it:
 
@@ -128,11 +166,11 @@ performed by the scripts themselves.
      section, `[roaring]` (see Clients below) — which is exactly why
      staging is named `roaring-staging` and not `roaring`.
 
-4. **Chroot pacman config**, at `/etc/aurutils/pacman-roaring-staging.conf`
+5. **Chroot pacman config**, at `/etc/aurutils/pacman-roaring-staging.conf`
    (`aur build -c -d roaring-staging` / `aur sync -c` look this up by repo
    name, falling back to devtools' defaults if absent — so the filename has
    to track `REPO_NAME`). Copy the devtools template and append a
-   `[roaring-staging]` section — **without** the `Usage` line from step 3:
+   `[roaring-staging]` section — **without** the `Usage` line from step 4:
 
    ```sh
    sudo install -Dm644 /usr/share/devtools/pacman.conf.d/extra.conf \
@@ -149,7 +187,7 @@ performed by the scripts themselves.
    This file configures pacman *inside the build container*, and there the
    repo must stay fully usable (`Usage` defaults to `All`): installing
    dependencies from staging is exactly what it's for. Do not copy step
-   3's `Usage = Sync` here — that would stop your packages from being able
+   4's `Usage = Sync` here — that would stop your packages from being able
    to depend on each other, and builds would fail on a missing dependency
    that is plainly sitting in the repo.
 
@@ -159,54 +197,91 @@ performed by the scripts themselves.
    itself lives under `/var/lib/aurbuild/x86_64/`, created on first use;
    deleting it is always safe.
 
-5. **Sudoers for the chroot helpers.** devtools has no rootless mode:
-   `mkarchroot`, `arch-nspawn`, and `makechrootpkg` need root. The
-   unattended timer needs these passwordless:
+6. **Sudoers for the chroot helpers — granted to the build account, not to
+   you.** devtools has no rootless mode: `mkarchroot`, `arch-nspawn`, and
+   `makechrootpkg` need root, and an unattended timer cannot answer a
+   password prompt.
 
    ```
-   # /etc/sudoers.d/pkgs
-   yourusername ALL=(root) NOPASSWD: /usr/bin/mkarchroot, /usr/bin/arch-nspawn, /usr/bin/makechrootpkg
+   # /etc/sudoers.d/pkgs   (install with: sudo visudo -f /etc/sudoers.d/pkgs)
+   pkgsbuild ALL=(root) NOPASSWD: /usr/bin/mkarchroot, /usr/bin/arch-nspawn, /usr/bin/makechrootpkg
    ```
 
    **Caveat, stated honestly (proposal §4):** NOPASSWD on
    `arch-nspawn`/`makechrootpkg` is effectively root-equivalent — both can
    be used to run arbitrary commands as root outside the container with the
-   right arguments. This limits *accident* surface (typos, runaway scripts),
-   not a malicious-user threat model. That's an acceptable tradeoff for your
-   own account on your own desktop; don't widen the NOPASSWD list beyond
-   these three binaries.
+   right arguments. Putting it on a dedicated account doesn't change that;
+   it changes who has it. Only something already running as `pkgsbuild` can
+   reach the rule, not every process under your login. Don't widen the list
+   beyond these three binaries, and don't add your own user back to it.
 
-6. **Install the config:**
+   Your own `sudo` keeps prompting for a password — building a package by
+   hand just asks for it, the way it always did.
+
+7. **Install the shared config.** It lives in `/etc` because both accounts
+   read it — the build user under the timer, you everywhere else:
 
    ```sh
-   mkdir -p ~/.config/pkgs
-   cp pkgs.conf.example ~/.config/pkgs/pkgs.conf
-   $EDITOR ~/.config/pkgs/pkgs.conf   # set REPO_NAME, PUBLISH_NAME, STAGING_DIR,
-                                      # PUBLISH_DIR, CUSTOM_DIRS, GPG_KEY, REMOTE
+   sudo install -Dm644 pkgs.conf.example /etc/pkgs/pkgs.conf
+   sudoedit /etc/pkgs/pkgs.conf   # set REPO_NAME, PUBLISH_NAME, STAGING_DIR,
+                                  # PUBLISH_DIR, CUSTOM_DIRS, GPG_KEY, REMOTE
    ```
 
-7. **Optional: pinning file**, only needed once you actually pin something:
+   Use absolute paths only: `$HOME` would expand to `/var/lib/pkgsbuild`
+   under the timer and to your home everywhere else. A
+   `~/.config/pkgs/pkgs.conf` still wins for whoever owns it, and
+   `$PKGS_CONF` beats both — that's what the throwaway-repo tests use.
+
+8. **Optional: pinning file**, only needed once you actually pin something.
+   It goes in the build user's home, because the timer's `aur sync -u` is
+   what reads it:
 
    ```sh
-   mkdir -p ~/.config/aurutils/sync
-   cp ignore.example ~/.config/aurutils/sync/ignore
+   sudo -u pkgsbuild mkdir -p /var/lib/pkgsbuild/.config/aurutils/sync
+   sudo install -o pkgsbuild -g pkgs -m 664 ignore.example \
+       /var/lib/pkgsbuild/.config/aurutils/sync/ignore
    ```
 
-8. **Enable the timer.** Check out this repo at `~/pkgs` (the shipped unit
-   uses `%h/pkgs/bin/pkgs-sync`), symlink or copy the units into your user
-   systemd dir, then enable:
+   Mode `664` and group `pkgs` are what let you edit it later without
+   `sudo`.
+
+9. **Install the tooling and enable the timer.** The checkout has to be
+   readable by the build user, so it can't live in your home (`0700`):
 
    ```sh
-   git clone <this-repo-url> ~/pkgs
-   mkdir -p ~/.config/systemd/user
-   ln -s ~/pkgs/systemd/pkgs-sync.service ~/pkgs/systemd/pkgs-sync.timer \
-       ~/.config/systemd/user/
-   systemctl --user daemon-reload
-   systemctl --user enable --now pkgs-sync.timer
-   loginctl enable-linger "$USER"   # run the timer with no session open
+   sudo install -d -o "$USER" -g pkgs -m 2775 /opt/pkgs
+   git clone <this-repo-url> /opt/pkgs
+
+   sudo systemctl link /opt/pkgs/systemd/pkgs-sync.service
+   sudo systemctl enable --now /opt/pkgs/systemd/pkgs-sync.timer
+   ```
+
+   `systemctl link` symlinks the units out of the checkout, so `git pull`
+   updates them in place (`sudo systemctl daemon-reload` afterwards). For a
+   checkout somewhere else, override the one path that hardcodes it with
+   `sudo systemctl edit pkgs-sync.service`:
+
+   ```ini
+   [Service]
+   ExecStart=
+   ExecStart=/your/path/bin/pkgs-sync
+   ```
+
+   These are **system** units (`sudo systemctl`, not `systemctl --user`), so
+   no `enable-linger` is needed — the timer fires whether or not anyone is
+   logged in. Verify:
+
+   ```sh
+   systemctl list-timers pkgs-sync.timer
+   sudo systemctl start pkgs-sync.service   # first run, on demand
+   journalctl -u pkgs-sync.service -f
    ```
 
 ## Day-to-day use
+
+All of this runs as **you**, not as the build user: the shared `pkgs` group
+gives you write access to the repos, and `sudo` prompting for a password is
+fine when you're sitting at the terminal.
 
 **Add an AUR package** (fetches, shows the diff for review, resolves AUR
 deps, chroot-builds, repo-adds):
@@ -219,12 +294,13 @@ aur sync -c foo
 one of your `CUSTOM_DIRS` entries, then:
 
 ```sh
-cd ~/pkgwork/custom/somefork-git
+cd /srv/pkgrepo/custom/somefork-git
 aur build -c -d roaring-staging
 ```
 
 Being in a configured `CUSTOM_DIRS` subdirectory *is* the provenance —
-nothing else is tracked.
+nothing else is tracked. The timer rebuilds VCS packages in these same
+directories, which is why they're group-writable.
 
 **Add a prebuilt / pinned package** (your own build, an old version you
 want to keep around):
@@ -237,10 +313,12 @@ repo-add -R "$STAGING_DIR/roaring-staging.db.tar.gz" \
 
 **Pin an old version of a package that *also* exists in the AUR** (the only
 case that needs bookkeeping — `aur sync -u` otherwise skips anything not in
-the AUR automatically): add a line to
-`~/.config/aurutils/sync/ignore`, e.g. `roaring-staging/electron25`. A
-repo-qualified entry names the staging repo — that is what `aur sync -u`
-operates on.
+the AUR automatically): add a line to the build user's ignore file,
+`/var/lib/pkgsbuild/.config/aurutils/sync/ignore`, e.g.
+`roaring-staging/electron25`. A repo-qualified entry names the staging repo
+— that is what `aur sync -u` operates on. It has to be that copy, in the
+build user's home: the timer's `aur sync` reads the build user's config, not
+yours.
 
 **Remove a package:**
 
@@ -260,8 +338,9 @@ bin/pkgs-publish
 ```
 
 One gpg passphrase prompt (gpg-agent caches it for the rest of the run),
-then one rsync. This is also the natural moment to review what the timer
-built:
+then one rsync. This stays yours alone: the build user has no signing key
+and no ssh credentials, and the timer never invokes gpg. It's also the
+natural moment to review what the timer built:
 
 **Inspect the repo:**
 
@@ -271,7 +350,8 @@ aur repo -d roaring-staging --list
 
 ### What the timer does, and what it deliberately doesn't
 
-`pkgs-sync` runs `aur sync -u -c` for AUR release packages, then a VCS pass
+`pkgs-sync` runs as `pkgsbuild` from the system timer. It runs
+`aur sync -u -c` for AUR release packages, then a VCS pass
 modelled on aurutils' shipped `examples/sync-devel`: it lists the repo, keeps
 the `-git`/`-hg`/`-svn`/`-bzr`/`-cvs`/`-darcs` members, runs `aur srcver` to
 compute each one's current upstream version, and compares that against the
@@ -286,8 +366,8 @@ Two consequences worth knowing:
   `aur build -c -d roaring-staging` in its directory). After that the timer
   keeps it current.
 - **A VCS package's PKGBUILD is looked up in `CUSTOM_DIRS` first**, and only
-  then in aurutils' own clone directory (`$AURDEST`, default
-  `~/.cache/aurutils/sync`). Being in a custom dir is what marks a package as
+  then in aurutils' own clone directory (`$AURDEST`, which for the timer
+  means the build user's `/var/lib/pkgsbuild/.cache/aurutils/sync`). Being in a custom dir is what marks a package as
   locally maintained, so it is refreshed from your working copy and never
   fetched from the AUR. Non-VCS custom packages are never rebuilt
   automatically — rebuild them yourself when you change them.
@@ -364,8 +444,8 @@ rebuild resolves the duplicate by glob order rather than by version, and
 glob order is lexical: `2.1.10` sorts before `2.1.9`. The `mv` preserves
 the db exactly as aurutils built it.
 
-Then update `/etc/pacman.conf` (step 3), rename
-`/etc/aurutils/pacman-<old>.conf` and its section (step 4), any
+Then update `/etc/pacman.conf` (step 4), rename
+`/etc/aurutils/pacman-<old>.conf` and its section (step 5), any
 repo-qualified lines in the aurutils ignore file, and `REPO_NAME` in
 `pkgs.conf`. Finally clear the stale sync db before refreshing, since the
 old name now belongs to the published repo:
@@ -391,7 +471,12 @@ Stated honestly (proposal §8), not glossed over:
   container. That's real protection against a build polluting the host, but
   a malicious package would still ship to clients once signed — the chroot
   doesn't inspect what a package *does* once installed.
-- `Usage = Sync` on the staging repo (setup step 3) keeps unsigned,
+- The timer builds as `pkgsbuild`, an account with no signing key, no ssh
+  key and no access to your home. It does hold the NOPASSWD chroot rule,
+  which is root-equivalent (setup step 6), so this is a smaller blast
+  radius, not a sandbox — what it buys is that nothing running under your
+  login inherits passwordless root.
+- `Usage = Sync` on the staging repo (setup step 4) keeps unsigned,
   unattended-built packages out of the builder desktop's own `pacman -Syu`.
   It is a guard against *accident*, not against a determined operator: an
   explicit `pacman -S roaring-staging/foo` still installs from staging.
@@ -419,7 +504,9 @@ No CI; test on the real machine, in this order, before committing:
 3. Exercise against a throwaway repo: point `PKGS_CONF` at a temp config
    under `/tmp` (`STAGING_DIR`/`PUBLISH_DIR` also under `/tmp`), `repo-add`
    an empty db there, and run the script for real. **Never test against the
-   live staging dir.**
+   live staging dir.** `$PKGS_CONF` outranks both `/etc/pkgs/pkgs.conf` and
+   any per-user config, so a throwaway run as yourself needs no root and
+   cannot reach the real repo.
 4. For `pkgs-sync` changes, use one cheap AUR package in the throwaway repo
    as a fixture, plus one VCS (`-git`) package to exercise the
    srcver/vercmp path; check both the "up to date" and "rebuild needed"

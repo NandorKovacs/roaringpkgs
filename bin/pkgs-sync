@@ -1,8 +1,9 @@
 #!/bin/bash
-# pkgs-sync — timer entry point. Refreshes the staging repo: AUR release
-# packages first, then a VCS pass that rebuilds only those VCS packages
-# whose upstream actually moved. Never touches gpg, GPG_KEY, PUBLISH_DIR,
-# or REMOTE, and never adds or removes repo members.
+# pkgs-sync — timer entry point, run by the system timer as the dedicated
+# build user. Refreshes the staging repo: AUR release packages first, then a
+# VCS pass that rebuilds only those VCS packages whose upstream actually
+# moved. Never touches gpg, GPG_KEY, PUBLISH_DIR, or REMOTE, and never adds
+# or removes repo members.
 #
 # The VCS pass follows aurutils' shipped examples/sync-devel: the local
 # repo's versions go to aur-vercmp on stdin, and the freshly computed
@@ -20,6 +21,7 @@ pkgs_load_conf
 pkgs_require REPO_NAME STAGING_DIR CUSTOM_DIRS
 pkgs_need_cmd aur awk mktemp
 pkgs_lock -n
+pkgs_need_staging_write
 
 # Where aurutils clones AUR build files (aur-sync(1): AURDEST).
 AURDEST=${AURDEST:-${XDG_CACHE_HOME:-$HOME/.cache}/aurutils/sync}
