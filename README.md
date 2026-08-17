@@ -2,7 +2,8 @@
 
 aurutils is the engine that builds and maintains the repo; these scripts
 just automate the two things worth automating (unattended sync, and the
-sign+publish step) and add the one wrapper removal genuinely needs. Packages
+sign+publish step) and add the two small wrappers removing and pruning
+packages genuinely need. Packages
 build unsigned into a staging repo on the desktop — under a dedicated
 unprivileged build account, driven by a system timer — then get manually
 signed by you and rsynced to an always-on LAN server that serves them as a
@@ -19,9 +20,10 @@ bin/
   pkgs-sync       timer entry point: aur sync -u -c, then a VCS srcver pass
   pkgs-publish    manual: sign staged packages, rebuild signed db, rsync
   pkgs-remove     repo-remove + delete matching package files from staging
+  pkgs-prune      manual: delete superseded package files from staging
 lib/
-  common.sh       shared helpers (config loading, locking, logging) — sourced,
-                  never executed directly
+  common.sh       shared helpers (config loading, locking, logging, the
+                  audit log) — sourced, never executed directly
 systemd/
   pkgs-sync.service / pkgs-sync.timer     system units, run as the build user
 pkgs.conf.example                          template for /etc/pkgs/pkgs.conf
@@ -288,6 +290,77 @@ performed by the scripts themselves.
    journalctl -u pkgs-sync.service -f
    ```
 
+## Logs
+
+There are two channels, and they answer different questions.
+
+**The audit log — what changed.** All four scripts append one line per
+mutating action, in the same format pacman uses for `/var/log/pacman.log`:
+
+```
+[2026-08-17T21:58:03+0000] [pkgs-sync] Running 'pkgs-sync' as pkgsbuild
+[2026-08-17T21:58:03+0000] [pkgs-sync] transaction started
+[2026-08-17T22:01:44+0000] [pkgs-sync] upgraded neovim-git (r3098.9f8e7d-1 -> r3120.a1b2c3-1)
+[2026-08-17T22:01:45+0000] [pkgs-sync] transaction completed (1 upgraded, 0 downgraded, 0 added, 0 removed, 0 failed)
+[2026-08-17T22:04:02+0000] [pkgs-publish] Running 'pkgs-publish' as nandor
+[2026-08-17T22:04:11+0000] [pkgs-publish] signed neovim-git (r3120.a1b2c3-1)
+[2026-08-17T22:04:18+0000] [pkgs-publish] rsynced to server.lan:/srv/roaring
+[2026-08-17T22:04:18+0000] [pkgs-publish] transaction completed (1 published, 1 signed, 0 unpublished)
+```
+
+`[timestamp] [script] message`. Attribution works the way it does in
+`pacman.log`: each run opens with a `Running` line naming the invocation and
+the account, and you attribute a change by scanning back to the nearest one.
+Every run is bracketed by `transaction started` / `transaction completed`, so
+a block with no closing line is a run that died partway.
+
+The verbs: `upgraded` / `downgraded` / `added` / `removed` (staging db
+membership and versions, from `pkgs-sync`); `published`, `signed`,
+`unpublished`, `rebuilt`, `rsynced` (`pkgs-publish`); `removed` and `deleted`
+(`pkgs-remove`); `deleted` (`pkgs-prune`). Every aggregated failure also
+appears, as `warning: ...`.
+
+`pkgs-sync` learns what changed by diffing the staging db's version listing
+across the run — `aur sync -u` builds packages without reporting which, so
+the db, which is the source of truth for membership anyway, is what gets
+compared.
+
+Where it lives: `$STAGING_DIR/pkgs.log`, or wherever `LOG_FILE` in
+`pkgs.conf` points. Both accounts append to it, so it has to sit in a
+directory both can write — `STAGING_DIR` already is, being setgid and group
+`pkgs`. The file is created mode 0664 for the same reason; if you relocate
+it, set its directory up the same way.
+
+Two deliberate behaviours: `-n` on `pkgs-publish` / `pkgs-remove` /
+`pkgs-prune` writes nothing at all (a dry run changes nothing, so it records
+nothing), and a log that cannot be written produces one warning and is then
+skipped — it never takes a build down, which matters most for the unattended
+timer.
+
+Nothing rotates this file, exactly as nothing rotates `pacman.log`. It grows
+by a handful of lines per run. If it ever gets big:
+
+```
+/srv/pkgrepo/staging/pkgs.log {
+    monthly
+    rotate 12
+    compress
+    missingok
+    notifempty
+    create 0664 pkgsbuild pkgs
+}
+```
+
+**The journal — why something failed.** Build output (aurutils, makepkg,
+gpg, rsync) goes to stderr, and for the timer on to the journal. That is
+where you look when the audit log says a package failed and you want to know
+why:
+
+```sh
+journalctl -u pkgs-sync.service -f          # follow the current run
+journalctl -u pkgs-sync.service -b          # this boot
+```
+
 ## Day-to-day use
 
 All of this runs as **you**, not as the build user: the shared `pkgs` group
@@ -340,6 +413,31 @@ bin/pkgs-remove -n foo       # dry run first if unsure
 
 If `foo` was a custom package, also delete its source directory under
 `CUSTOM_DIRS` by hand — `pkgs-remove` only touches the staging repo.
+
+**Prune old versions:**
+
+```sh
+bin/pkgs-prune -n            # dry run: what would go, for every package
+bin/pkgs-prune               # keep only the newest version of each package
+bin/pkgs-prune -k 2 foo      # keep the two newest versions of foo
+```
+
+A rebuild replaces a package's *database entry*, but the file the old entry
+pointed at stays on disk — so staging accumulates dead versions, and
+`pkgs-publish` faithfully signs and ships every one of them. `pkgs-prune`
+deletes them. It only ever removes files, never database entries: a
+superseded version has no entry left. Order is decided by `vercmp`, so
+epochs and `r120.abcdef1`-style VCS versions sort correctly.
+
+The version the staging db points at is never deleted, whatever its age.
+That is what keeps a pinned old package safe when a newer build is still
+lying around in staging — pruning it would leave a db entry with no file
+behind it and break every client that tried to install it.
+
+Nothing prunes automatically: the timer never deletes builds, and this is
+not part of `pkgs-publish` either. Run it when staging gets fat, then
+publish — `pkgs-publish` mirrors staging, so the deletions propagate to the
+server on the next run.
 
 **Publish** (sign staged packages, rebuild the signed db, rsync to the
 server):
@@ -511,7 +609,8 @@ No CI; test on the real machine, in this order, before committing:
 
 1. `bash -n` and `shellcheck` on every touched script.
 2. Prefer a `-n` dry-run flag for new destructive behaviour in
-   `pkgs-publish`/`pkgs-remove`; echo the commands instead of running them.
+   `pkgs-publish`/`pkgs-remove`/`pkgs-prune`; echo the commands instead of
+   running them.
 3. Exercise against a throwaway repo: point `PKGS_CONF` at a temp config
    under `/tmp` (`STAGING_DIR`/`PUBLISH_DIR` also under `/tmp`), `repo-add`
    an empty db there, and run the script for real. **Never test against the
@@ -524,3 +623,7 @@ No CI; test on the real machine, in this order, before committing:
    outcomes.
 5. For `pkgs-publish` changes, point `REMOTE` at a local directory first and
    inspect the result before aiming it at the server.
+6. For `pkgs-prune` changes, stock the throwaway staging dir with several
+   versions of a few packages (include an epoch, a `-git` package, and a
+   `foo`/`foo-bin` name pair), `repo-add` only some of them, and check
+   afterwards that every db entry still has a file behind it.

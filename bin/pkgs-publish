@@ -27,6 +27,9 @@ skipping, since this is a manual, interactive step.
 EOF
 }
 
+# Captured before getopts shifts it, for the audit log's "Running" line.
+PKGS_ARGV=("$@")
+
 DRY_RUN=0
 while getopts ':nh' opt; do
     case $opt in
@@ -59,10 +62,18 @@ pkgs_need_cmd gpg repo-add rsync cmp
 
 [[ -d $STAGING_DIR ]] || die "staging dir does not exist: $STAGING_DIR"
 
+# A dry run changes nothing, so it records nothing: leaving the log closed
+# makes every pkgs_log below a no-op without a conditional at each call site,
+# and keeps the -n path from depending on the log being writable.
+((DRY_RUN)) || pkgs_log_open
+
 # Interactive path: block until any concurrent timer sync releases the
 # lock, rather than silently doing nothing (that's the -n behavior in
 # pkgs-sync, not appropriate here).
 pkgs_lock
+
+pkgs_log_run "${PKGS_ARGV[@]}"
+pkgs_log "transaction started"
 
 [[ -d $PUBLISH_DIR ]] || run mkdir -p "$PUBLISH_DIR"
 
@@ -89,6 +100,7 @@ for src in "${staged_pkgs[@]}"; do
         run rm -f "$dst.sig"
         dirty[$name]=1
         n_copied=$((n_copied + 1))
+        pkgs_log "published $(pkgs_pkgid "$name")"
     fi
 done
 
@@ -108,6 +120,7 @@ for src in "${staged_pkgs[@]}"; do
     if gpg --detach-sign -u "$GPG_KEY" --output "$tmp" "$dst"; then
         mv -f "$tmp" "$sig"
         n_signed=$((n_signed + 1))
+        pkgs_log "signed $(pkgs_pkgid "$name")"
     else
         rm -f "$tmp"
         pkgs_fail "failed to sign $name"
@@ -135,6 +148,7 @@ for dst in "${published_pkgs[@]}"; do
     if [[ -z ${staged_names[$name]+x} ]]; then
         run rm -f "$dst" "$dst.sig"
         n_pruned=$((n_pruned + 1))
+        pkgs_log "unpublished $(pkgs_pkgid "$name")"
     fi
 done
 
@@ -171,6 +185,7 @@ if ((${#publish_pkgs[@]} > 0)); then
     if ! run repo-add -s -v -k "$GPG_KEY" "$PUBLISH_DIR/$PUBLISH_NAME.db.tar.gz" "${publish_pkgs[@]}"; then
         die "repo-add failed; aborting before rsync"
     fi
+    pkgs_log "rebuilt ${#publish_pkgs[@]} package(s) into $PUBLISH_NAME.db.tar.gz"
 else
     msg "no packages in $PUBLISH_DIR; skipping repo-add (empty repo)"
 fi
@@ -180,5 +195,11 @@ fi
 if ! run rsync -a --delete "$PUBLISH_DIR/" "$REMOTE/"; then
     die "rsync to $REMOTE failed"
 fi
+pkgs_log "rsynced to $REMOTE"
+
+# The die paths above deliberately leave the transaction unterminated: an
+# audit log block with no "transaction completed" is how a run that died
+# announces itself.
+pkgs_log "transaction completed ($n_copied published, $n_signed signed, $n_pruned unpublished)"
 
 msg "done: $n_copied copied, $n_signed signed, $n_pruned pruned"

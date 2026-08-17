@@ -19,9 +19,16 @@ _lib=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh
 
 pkgs_load_conf
 pkgs_require REPO_NAME STAGING_DIR CUSTOM_DIRS
-pkgs_need_cmd aur awk mktemp
+# vercmp (pacman) only orders the two sides of a version change, to tell an
+# upgrade from a downgrade in the audit log.
+pkgs_need_cmd aur awk mktemp vercmp
+# Opened before the lock so the skipped-run line can be written.
+pkgs_log_open
 pkgs_lock -n
 pkgs_need_staging_write
+
+pkgs_log_run "$@"
+pkgs_log "transaction started"
 
 # Where aurutils clones AUR build files (aur-sync(1): AURDEST).
 AURDEST=${AURDEST:-${XDG_CACHE_HOME:-$HOME/.cache}/aurutils/sync}
@@ -39,6 +46,36 @@ trap 'rm -rf "$tmp"' EXIT
 for _d in "${CUSTOM_DIRS[@]}"; do
     [[ -d $_d ]] || pkgs_fail "CUSTOM_DIRS entry missing: $_d"
 done
+
+# snapshot_db ARRAY FILE — read the repo's "pkgname version" listing into the
+# named associative array, via FILE. Non-zero if the listing failed.
+snapshot_db() {
+    local -n _snap=$1
+    local file=$2 n v
+    _snap=()
+    aur repo -d "$REPO_NAME" --list >"$file" || return 1
+    while read -r n v _; do
+        [[ -n $n ]] || continue
+        # $n is a string key, not an index: shellcheck cannot see through
+        # the nameref that this is an associative array.
+        # shellcheck disable=SC2004
+        _snap[$n]=$v
+    done <"$file"
+    return 0
+}
+
+# What the audit log needs is the set of packages this run changed, and
+# `aur sync -u` never reports what it built — pacman can log "upgraded foo
+# (old -> new)" only because pacman is the thing performing the transaction,
+# and here aurutils is. So diff the db's version listing across the run
+# instead. Repo membership's source of truth is that db, and the staging lock
+# is held from here to the end, so the difference is exactly this run's work.
+declare -A before=()
+have_before=1
+if ! snapshot_db before "$tmp/before"; then
+    pkgs_fail "aur repo -d $REPO_NAME --list failed (pre-run snapshot)"
+    have_before=0
+fi
 
 ## Pass 1 — AUR release packages, chroot builds.
 if ! aur sync -u -c -d "$REPO_NAME" --no-view --noconfirm; then
@@ -139,5 +176,50 @@ fi
 # that is not yet in the repo is deliberately not built: adding members is
 # a manual step (aur build -c -d "$REPO_NAME"), never the timer's job.
 # Non-VCS custom packages are never rebuilt automatically at all.
+
+## Audit — diff the db against the pre-run snapshot and record what moved.
+
+n_upgraded=0
+n_downgraded=0
+n_added=0
+n_removed=0
+
+if ((have_before)); then
+    declare -A after=()
+    if snapshot_db after "$tmp/after"; then
+        # Sorted so a run's lines are in a stable order rather than the
+        # associative array's hash order.
+        while read -r name; do
+            [[ -n $name ]] || continue
+            new=${after[$name]}
+            old=${before[$name]-}
+            if [[ -z $old ]]; then
+                pkgs_log "added $name ($new)"
+                n_added=$((n_added + 1))
+            elif [[ $old != "$new" ]]; then
+                if (($(vercmp "$new" "$old") < 0)); then
+                    pkgs_log "downgraded $name ($old -> $new)"
+                    n_downgraded=$((n_downgraded + 1))
+                else
+                    pkgs_log "upgraded $name ($old -> $new)"
+                    n_upgraded=$((n_upgraded + 1))
+                fi
+            fi
+        done < <(printf '%s\n' "${!after[@]}" | sort)
+
+        # Membership is never changed here — adding and removing members are
+        # manual steps — so either direction is worth a line if it happens.
+        while read -r name; do
+            [[ -n $name ]] || continue
+            [[ -n ${after[$name]+x} ]] && continue
+            pkgs_log "removed $name (${before[$name]})"
+            n_removed=$((n_removed + 1))
+        done < <(printf '%s\n' "${!before[@]}" | sort)
+    else
+        pkgs_fail "aur repo -d $REPO_NAME --list failed (post-run snapshot)"
+    fi
+fi
+
+pkgs_log "transaction completed ($n_upgraded upgraded, $n_downgraded downgraded, $n_added added, $n_removed removed, ${#PKGS_FAILURES[@]} failed)"
 
 pkgs_fail_report

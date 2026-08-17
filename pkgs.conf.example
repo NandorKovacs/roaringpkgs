@@ -46,6 +46,17 @@ CUSTOM_DIRS=(
 # 2775) and must live outside your home directory, which the build user
 # cannot traverse.
 
+# Audit log: one pacman-style line per mutating action, appended by all four
+# scripts (see the Logs section of the README). Named after pacman.conf's
+# LogFile and, like it, commented out here — the default is supplied by the
+# code, and is $STAGING_DIR/pkgs.log.
+#
+# Both accounts append to this file, so it has to sit somewhere both can
+# write: a directory group-owned by the shared group and setgid, which
+# STAGING_DIR already is. Point this elsewhere only after setting that
+# directory up the same way. The file itself is created mode 0664.
+#LOG_FILE=/srv/pkgrepo/staging/pkgs.log
+
 # Signing key. Read by pkgs-publish only, which you run yourself — the build
 # user has no key, and the timer path never invokes gpg.
 GPG_KEY=0xDEADBEEFDEADBEEF

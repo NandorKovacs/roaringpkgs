@@ -41,6 +41,9 @@ if [[ ${1-} == --help ]]; then
     exit 0
 fi
 
+# Captured before getopts shifts it, for the audit log's "Running" line.
+PKGS_ARGV=("$@")
+
 DRY_RUN=0
 while getopts ':nh' opt; do
     case $opt in
@@ -74,8 +77,18 @@ pkgs_need_cmd repo-remove
 # Manual, interactive mutation of the staging db — block until any
 # concurrent timer sync releases the lock rather than silently no-op'ing
 # (that -n/nonblock behavior belongs to pkgs-sync, not here).
+# A dry run changes nothing, so it records nothing: leaving the log closed
+# makes every pkgs_log below a no-op.
+((DRY_RUN)) || pkgs_log_open
+
 pkgs_lock
 pkgs_need_staging_write
+
+pkgs_log_run "${PKGS_ARGV[@]}"
+pkgs_log "transaction started"
+
+n_removed=0 # db entries
+n_deleted=0 # package files
 
 # repo-remove is all-or-nothing across its argument list: given one name it
 # cannot find, it reports an error and leaves the database completely
@@ -90,6 +103,8 @@ for pkg in "$@"; do
         pkgs_fail "$pkg: not removed from the db; leaving its files alone"
         continue
     fi
+    pkgs_log "removed $pkg"
+    n_removed=$((n_removed + 1))
 
     # Candidate files: anything starting with "$pkg-". A real pacman
     # package filename has the shape NAME-VERSION-REL-ARCH.pkg.tar.zst
@@ -113,9 +128,18 @@ for pkg in "$@"; do
     for f in "${candidates[@]}"; do
         base=${f##*/}
         rest=${base#"$pkg"-}
-        [[ $rest =~ ^[0-9][^/-]*-[0-9][^/-]*-[^/-]+\.pkg\.tar\.(zst|xz)(\.sig)?$ ]] || continue
+        # VERSION-REL is captured for the audit log; the trailing group tells
+        # a package apart from its detached signature, so one deletion of the
+        # pair does not become two log lines.
+        [[ $rest =~ ^([0-9][^/-]*-[0-9][^/-]*)-[^/-]+\.pkg\.tar\.(zst|xz)(\.sig)?$ ]] || continue
+        ver=${BASH_REMATCH[1]}
+        is_sig=${BASH_REMATCH[3]}
         run rm -f "$f"
         removed=$((removed + 1))
+        if [[ -z $is_sig ]]; then
+            pkgs_log "deleted $pkg ($ver)"
+            n_deleted=$((n_deleted + 1))
+        fi
     done
 
     if ((removed == 0)); then
@@ -124,6 +148,8 @@ for pkg in "$@"; do
         msg "removed $removed file(s) for $pkg from $STAGING_DIR"
     fi
 done
+
+pkgs_log "transaction completed ($n_removed removed, $n_deleted file(s) deleted, ${#PKGS_FAILURES[@]} failed)"
 
 # Non-zero exit if any package could not be removed from the db.
 pkgs_fail_report

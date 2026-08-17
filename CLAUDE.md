@@ -23,6 +23,7 @@ package manager; that's why it was dropped.)
 bin/pkgs-sync       # timer entry point: aur sync -u -c, then VCS srcver pass
 bin/pkgs-publish    # manual: sign staged pkgs, rebuild signed db, rsync to server
 bin/pkgs-remove     # repo-remove + delete pkg files from staging
+bin/pkgs-prune      # manual: delete superseded pkg files from staging
 lib/common.sh       # sourced helpers: config, lock, logging, failure aggregation
 systemd/            # SYSTEM pkgs-sync.service + .timer, User=pkgsbuild
 pkgs.conf.example   # template for /etc/pkgs/pkgs.conf
@@ -72,6 +73,11 @@ ignore.example      # template for the build user's aurutils sync/ignore
   `repo-add -s -v -k $GPG_KEY`. Copy-on-content-difference (`cmp`), because
   VCS rebuilds reuse filenames. Prune before rebuilding the db. rsync
   (`-a --delete`) is the last step.
+- `pkgs-prune` deletes package *files* only — never db entries (a
+  superseded version has no entry left) and never anything a staging db
+  entry still points at, which is what keeps a deliberately pinned old
+  version alive. Version ordering is `vercmp`, never a string/`sort -V`
+  comparison. It is manual: the timer must not silently delete builds.
 - VCS rebuild detection = `aur srcver` vs `aur vercmp -d $REPO_NAME`
   (aurutils' shipped sync-devel pattern). No stored HEAD state.
 
