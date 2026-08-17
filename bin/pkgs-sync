@@ -115,9 +115,13 @@ custom_dir() {
 # resolves a pkgbase as a subdirectory of the working directory, so it has
 # to run from the parent. This executes the PKGBUILD's pkgver() against the
 # latest upstream checkout; it is the slow part of the run.
+#
+# pkgver() is chatty even when it works, so its stderr is held back and
+# replayed only if srcver fails — a failure here is otherwise reported as a
+# bare "aur srcver failed" with the reason discarded.
 srcver_into() {
     local out=$1 dir=$2
-    (cd "${dir%/*}" && aur srcver "${dir##*/}") >>"$out" 2>/dev/null
+    (cd "${dir%/*}" && pkgs_stderr_on_fail aur srcver "${dir##*/}") >>"$out"
 }
 
 declare -A pkgdir=()
@@ -133,7 +137,10 @@ if [[ -s $tmp/vcs ]]; then
             # An AUR clone: refresh it so srcver sees new downstream commits.
             dir=$AURDEST/$pkgbase
             mkdir -p "$AURDEST"
-            if ! (cd "$AURDEST" && aur fetch -S "$pkgbase") >/dev/null 2>&1; then
+            # Progress chatter on stdout stays discarded; git reports what
+            # actually went wrong on stderr, so that is kept back and
+            # replayed only on failure.
+            if ! (cd "$AURDEST" && pkgs_stderr_on_fail aur fetch -S "$pkgbase") >/dev/null; then
                 pkgs_fail "aur fetch failed: $pkgbase"
             fi
         fi

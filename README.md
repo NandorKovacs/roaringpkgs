@@ -338,7 +338,9 @@ skipped — it never takes a build down, which matters most for the unattended
 timer.
 
 Nothing rotates this file, exactly as nothing rotates `pacman.log`. It grows
-by a handful of lines per run. If it ever gets big:
+by a handful of lines per run, so this is unlikely to ever matter — but if it
+does, hand it to logrotate by writing `/etc/logrotate.d/pkgs` (root-owned,
+mode 644, or logrotate ignores it):
 
 ```
 /srv/pkgrepo/staging/pkgs.log {
@@ -348,13 +350,32 @@ by a handful of lines per run. If it ever gets big:
     missingok
     notifempty
     create 0664 pkgsbuild pkgs
+    su pkgsbuild pkgs
 }
 ```
+Rotation runs off `logrotate.timer`, which is not enabled by default on Arch
+— `sudo systemctl enable --now logrotate.timer` if it isn't already. Check
+the config without waiting for it, or changing anything, with
+`sudo logrotate --debug /etc/logrotate.d/pkgs`.
 
 **The journal — why something failed.** Build output (aurutils, makepkg,
 gpg, rsync) goes to stderr, and for the timer on to the journal. That is
 where you look when the audit log says a package failed and you want to know
-why:
+why.
+
+A few commands are noisy when they succeed and only interesting when they
+don't — `aur srcver` runs `pkgver()` for every VCS package on every tick,
+`gpg --verify` announces every good signature, `aur fetch` prints git
+progress. Their stderr is held back and printed only if the command fails,
+indented under the failure it explains:
+
+```
+pkgs-sync:   ==> ERROR: pkgver() failed: command not found: cargo
+pkgs-sync: warning: aur srcver failed: somefork-git
+```
+
+So a quiet run really is a clean one, and a failed one carries its reason
+rather than just its name.
 
 ```sh
 journalctl -u pkgs-sync.service -f          # follow the current run

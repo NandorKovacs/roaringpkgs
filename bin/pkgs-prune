@@ -1,0 +1,242 @@
+#!/bin/bash
+# pkgs-prune — delete superseded package files from the staging repo,
+# keeping only the newest version of each package.
+#
+# aurutils/repo-add replace a package's *database entry* on every rebuild
+# but never delete the file the old entry pointed at, so staging grows a
+# tail of dead versions. pkgs-publish copies (and signs) everything it finds
+# in staging, so that tail gets shipped to the server forever unless
+# something trims it. That something is this script.
+#
+# Usage: pkgs-prune [-n] [-k N] [-h] [PKGNAME...]
+set -euo pipefail
+
+PKGS_PROG=pkgs-prune
+_lib=$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/../lib/common.sh
+# shellcheck source-path=SCRIPTDIR source=../lib/common.sh
+. "$_lib"
+
+usage() {
+    cat <<'EOF'
+usage: pkgs-prune [-n] [-k N] [-h] [PKGNAME...]
+
+Delete old package files from STAGING_DIR, keeping the newest version of
+each package. With no PKGNAME, every package in staging is pruned; with
+names, only those. Blocks (waits) on the staging lock rather than skipping,
+since this is a manual, mutating operation.
+
+  -n              dry run: echo the rm commands instead of running them
+  -k N            keep the N newest versions of each package (default 1)
+  -h, --help      show this help
+
+Only files are removed, never database entries: a superseded version has no
+entry left in the staging db, so there is nothing for repo-remove to do. To
+drop a package entirely, use pkgs-remove.
+
+The version a staging db entry points at is never deleted, whatever its age
+— that is what protects a deliberately pinned old package whose newer build
+is still lying around in staging.
+
+Only the staging repo is touched here. The prune reaches the server on the
+next pkgs-publish, which mirrors staging into PUBLISH_DIR.
+EOF
+}
+
+# Accept --help as a bare first argument; getopts below only understands
+# the short form.
+if [[ ${1-} == --help ]]; then
+    usage
+    exit 0
+fi
+
+# Captured before getopts shifts it, for the audit log's "Running" line.
+PKGS_ARGV=("$@")
+
+DRY_RUN=0
+KEEP=1
+while getopts ':nk:h' opt; do
+    case $opt in
+        n) DRY_RUN=1 ;;
+        k) KEEP=$OPTARG ;;
+        h) usage; exit 0 ;;
+        :) usage >&2; die "option -$OPTARG requires an argument" ;;
+        *) usage >&2; exit 1 ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+if [[ ! $KEEP =~ ^[0-9]+$ ]] || ((KEEP < 1)); then
+    die "-k takes a positive integer, got: $KEEP"
+fi
+
+# run CMD... — execute, or under -n just echo what would run.
+run() {
+    if ((DRY_RUN)); then
+        printf '+ %s\n' "$*" >&2
+    else
+        "$@"
+    fi
+}
+
+pkgs_load_conf
+pkgs_require REPO_NAME STAGING_DIR
+# vercmp (pacman) orders the versions; bsdtar reads the staging db.
+pkgs_need_cmd vercmp bsdtar
+
+[[ -d $STAGING_DIR ]] || die "staging dir does not exist: $STAGING_DIR"
+
+# Manual, interactive mutation of staging — block until any concurrent timer
+# sync releases the lock, like pkgs-remove and pkgs-publish do. Deleting
+# files mid-build would be a genuine race: `aur build` writes the new package
+# into STAGING_DIR before repo-add records it.
+# A dry run changes nothing, so it records nothing: leaving the log closed
+# makes every pkgs_log below a no-op.
+((DRY_RUN)) || pkgs_log_open
+
+pkgs_lock
+pkgs_need_staging_write
+
+pkgs_log_run "${PKGS_ARGV[@]}"
+pkgs_log "transaction started"
+
+# sort_desc VERSION... — print the given versions newest-first.
+#
+# Selection sort over vercmp(8), because pacman versions are not sortable by
+# any general-purpose comparator: epochs (`1:2.0`), `1.0rc1` < `1.0`, and
+# `r120.abcdef1` VCS versions all need pacman's own rules. The lists are
+# per-package and a few entries long, so O(n^2) forks are irrelevant.
+sort_desc() {
+    local -a v=("$@")
+    local i best
+    while ((${#v[@]})); do
+        best=0
+        for ((i = 1; i < ${#v[@]}; i++)); do
+            if (($(vercmp "${v[i]}" "${v[best]}") > 0)); then
+                best=$i
+            fi
+        done
+        printf '%s\n' "${v[best]}"
+        unset 'v[best]'
+        v=("${v[@]}")
+    done
+}
+
+# --- Index the package files in staging --------------------------------
+#
+# A pacman package file is NAME-VERSION-REL-ARCH.pkg.tar.EXT, and none of
+# VERSION, REL or ARCH may contain a hyphen — so matching greedily from the
+# left assigns the longest possible NAME, which is the only correct reading
+# ("foo-bar-1.0-1-any" is package foo-bar, never package foo). REL is
+# digit-led (pkgrel is a number); VERSION is not, since VCS packages
+# routinely carry versions like "r120.abcdef1".
+# .xz is indexed as well as .zst: an old prebuilt drop may still use it, and
+# pkgs-publish ships both, so leaving one behind would keep publishing a
+# version this script claims to have pruned.
+shopt -s nullglob
+staged=("$STAGING_DIR"/*.pkg.tar.zst "$STAGING_DIR"/*.pkg.tar.xz)
+shopt -u nullglob
+
+declare -A vers=()  # pkgname -> space-separated version list
+declare -A files=() # "pkgname ver" -> newline-separated paths (one per arch)
+
+for f in "${staged[@]}"; do
+    base=${f##*/}
+    stem=${base%.pkg.tar.*}
+    if [[ ! $stem =~ ^(.+)-([^-]+)-([0-9][^-]*)-([^-]+)$ ]]; then
+        warn "not a package file name, ignoring: $base"
+        continue
+    fi
+    name=${BASH_REMATCH[1]}
+    ver=${BASH_REMATCH[2]}-${BASH_REMATCH[3]}
+    key="$name $ver"
+
+    if [[ -z ${files[$key]+x} ]]; then
+        files[$key]=$f
+        vers[$name]="${vers[$name]+${vers[$name]} }$ver"
+    else
+        # Same name and version, different arch (a package that switched to
+        # or from `any`): both files back the same version, so they live or
+        # die together.
+        files[$key]+=$'\n'$f
+    fi
+done
+
+# --- What the staging db points at -------------------------------------
+#
+# Repo membership's source of truth is the db, and a db entry whose file is
+# gone breaks every client that tries to install it. So read the versions it
+# references and treat those files as untouchable even when newer files
+# exist: that is exactly the shape of a pinned package (an old version
+# repo-add'ed on purpose, its newer build still sitting in staging).
+# The db is a tarball of one PKGNAME-VERSION-REL/ directory per entry.
+declare -A dbver=()
+db=$(pkgs_db)
+if [[ -f $db ]]; then
+    while IFS= read -r entry; do
+        entry=${entry%%/*}
+        [[ $entry =~ ^(.+)-([^-]+)-([0-9][^-]*)$ ]] || continue
+        dbver[${BASH_REMATCH[1]}]=${BASH_REMATCH[2]}-${BASH_REMATCH[3]}
+    done < <(bsdtar -tf "$db")
+else
+    warn "no staging database at $db: nothing is protected from pruning"
+fi
+
+# --- Prune -------------------------------------------------------------
+
+if (($#)); then
+    targets=("$@")
+elif ((${#vers[@]})); then
+    mapfile -t targets < <(printf '%s\n' "${!vers[@]}" | sort)
+else
+    targets=()
+fi
+
+n_pruned=0
+n_pkgs=0
+
+for name in "${targets[@]}"; do
+    if [[ -z ${vers[$name]+x} ]]; then
+        # Only reachable for a name given on the command line: a typo, or a
+        # package whose files are already gone. Either way worth a non-zero
+        # exit rather than a silent success.
+        pkgs_fail "no package files in $STAGING_DIR for $name"
+        continue
+    fi
+
+    read -ra vlist <<<"${vers[$name]}"
+    ((${#vlist[@]} > KEEP)) || continue
+
+    kept=0
+    pruned_here=0
+    while IFS= read -r ver; do
+        if ((kept < KEEP)); then
+            kept=$((kept + 1))
+            continue
+        fi
+        if [[ ${dbver[$name]-} == "$ver" ]]; then
+            msg "$name: keeping $ver, the staging db points at it"
+            continue
+        fi
+        key="$name $ver"
+        while IFS= read -r f; do
+            run rm -f "$f" "$f.sig"
+            pruned_here=$((pruned_here + 1))
+        done <<<"${files[$key]}"
+        # One line per version, not per file: a package that ships both an
+        # arch-specific and an `any` file has two paths backing one version.
+        pkgs_log "deleted $name ($ver)"
+    done < <(sort_desc "${vlist[@]}")
+
+    if ((pruned_here)); then
+        msg "$name: pruned $pruned_here package file(s)"
+        n_pruned=$((n_pruned + pruned_here))
+        n_pkgs=$((n_pkgs + 1))
+    fi
+done
+
+pkgs_log "transaction completed ($n_pruned file(s) deleted from $n_pkgs package(s), ${#PKGS_FAILURES[@]} failed)"
+
+msg "done: pruned $n_pruned package file(s) from $n_pkgs package(s)"
+
+# Non-zero exit if any explicitly named package had no files in staging.
+pkgs_fail_report

@@ -58,7 +58,8 @@ pkgs_require REPO_NAME STAGING_DIR PUBLISH_DIR GPG_KEY REMOTE
 # this script touches REPO_NAME — staging is read by filename, not by db.
 # Defaulting keeps configs predating the split working.
 : "${PUBLISH_NAME:=$REPO_NAME}"
-pkgs_need_cmd gpg repo-add rsync cmp
+# mktemp: pkgs_stderr_on_fail parks gpg's output in a temporary file.
+pkgs_need_cmd gpg repo-add rsync cmp mktemp
 
 [[ -d $STAGING_DIR ]] || die "staging dir does not exist: $STAGING_DIR"
 
@@ -163,7 +164,11 @@ if ((!DRY_RUN)); then
         dst="$PUBLISH_DIR/$name"
         if [[ ! -e $dst.sig ]]; then
             pkgs_fail "missing signature: $name"
-        elif ! gpg --verify "$dst.sig" "$dst" >/dev/null 2>&1; then
+        # gpg reports on stderr either way, announcing every good signature
+        # too, so it is held back and replayed only when verification fails —
+        # which is when the distinction between a bad signature, an unknown
+        # key and an expired one is the whole story.
+        elif ! pkgs_stderr_on_fail gpg --verify "$dst.sig" "$dst" >/dev/null; then
             pkgs_fail "invalid signature: $name"
         fi
     done

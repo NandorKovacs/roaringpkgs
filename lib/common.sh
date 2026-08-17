@@ -104,6 +104,43 @@ pkgs_log_run() {
     pkgs_log "Running '$PKGS_PROG${*:+ $*}' as $(id -un)"
 }
 
+# pkgs_stderr_on_fail CMD... — run CMD with its stderr held back, and print
+# that stderr only if CMD fails. Returns CMD's own exit status. stdout is
+# untouched, so the caller redirects it as usual.
+#
+# For the commands that are noisy on success and only interesting on failure.
+# Silencing them outright is what this replaces, and it made every failure
+# report the fact ("aur srcver failed: foo") while discarding the reason.
+# Letting the noise through instead is no better: aur-srcver runs pkgver() for
+# every VCS package on every daily tick, and gpg --verify announces a good
+# signature for every package on every publish, so the journal would fill with
+# output nobody reads and the real failures would sink into it.
+#
+# stderr goes to a temporary file rather than through descriptor juggling.
+# The obvious `err=$({ "$@" 2>&1 1>&3 3>&-; } 3>&1)` does not work here: the
+# command substitution has already replaced stdout with its capture pipe by
+# the time `3>&1` runs, so fd 3 becomes the pipe rather than the caller's
+# stdout, and the command's stdout is swallowed into the replay. A file
+# leaves stdout untouched by construction.
+pkgs_stderr_on_fail() {
+    local err rc=0 line
+    if ! err=$(mktemp 2>/dev/null); then
+        # Without somewhere to put it, letting stderr through beats losing it.
+        "$@"
+        return $?
+    fi
+    "$@" 2>"$err" || rc=$?
+    if ((rc)) && [[ -s $err ]]; then
+        # Indented like pkgs_fail_report's entries, so the block reads as
+        # belonging to the failure message the caller reports next.
+        while IFS= read -r line; do
+            printf '%s:   %s\n' "$PKGS_PROG" "$line" >&2
+        done <"$err"
+    fi
+    rm -f "$err"
+    return "$rc"
+}
+
 # pkgs_load_conf — source the machine config. All paths come from here.
 #
 # Lookup order: $PKGS_CONF, the calling account's own config dir, then the
