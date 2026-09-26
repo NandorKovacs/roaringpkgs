@@ -83,6 +83,9 @@ pkgs_need_cmd repo-remove
 
 pkgs_lock
 pkgs_need_staging_write
+# repo-remove rewrites the db in place, so the db's own mode matters here;
+# pkgs-prune deletes package files only and deliberately does not check it.
+pkgs_need_db_write
 
 pkgs_log_run "${PKGS_ARGV[@]}"
 pkgs_log "transaction started"

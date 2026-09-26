@@ -97,20 +97,51 @@ performed by the scripts themselves.
 
 3. **Create the staging, publish, and custom dirs and an empty staging db**
    (proposal §2). All three are group-owned and group-writable, setgid so
-   that everything created inside keeps the `pkgs` group:
+   that everything created inside keeps the `pkgs` group, and carry a default
+   ACL so that everything created inside stays group-*writable* as well:
 
    ```sh
    sudo install -d -o pkgsbuild -g pkgs -m 2775 \
        /srv/pkgrepo/staging /srv/pkgrepo/publish /srv/pkgrepo/custom
-   (umask 002; repo-add /srv/pkgrepo/staging/roaring-staging.db.tar.gz)
+   sudo setfacl -d -m g::rwx \
+       /srv/pkgrepo/staging /srv/pkgrepo/publish /srv/pkgrepo/custom
+   repo-add /srv/pkgrepo/staging/roaring-staging.db.tar.gz
    ```
 
    Both accounts write all three: the timer builds into staging and rebuilds
    VCS packages in place in the custom dirs, while you add packages, remove
-   them, and publish. Creating and deleting files is governed by the
-   directory's permissions, not the files', so it doesn't matter which
-   account owns any given file. Use `umask 002` when you work in these dirs
-   (the unit sets it for the timer) so what you create stays group-writable.
+   them, and publish. *Creating and deleting* files is governed by the
+   directory's permissions, so for those it genuinely doesn't matter which
+   account owns any given file — but the repo database is *modified in place*,
+   and there the file's own mode is what decides.
+
+   **Which is why the default ACL is not optional.** `repo-add` and
+   `repo-remove` set `umask 0022` themselves, near the top of the script,
+   overriding both the unit's `UMask=0002` and whatever your login uses. So
+   every database they write lands 0644, owned by whichever account ran them,
+   and the other account is then locked out of it — `aur build` checks the db
+   for writability and refuses to start at all, reporting a bare `permission
+   denied` and exit 13. `sudo makechrootpkg` resets the umask the same way,
+   which is why packages come out 0644 too. A default ACL is the fix that
+   holds: when a directory has one, the process umask is ignored for files
+   created there, so a hardcoded `umask 0022` cannot win. Nothing in this
+   tooling can paper over it instead — the whole point is that you drive
+   `aur sync -c foo` yourself, and none of our code is in that path.
+
+   `umask 002` is still worth using when you work in these dirs by hand (the
+   unit sets it for the timer), for the tools that do respect it.
+
+   To repair a repo created before the ACL — the symptom is each account
+   locked out of the databases the other one wrote:
+
+   ```sh
+   sudo chmod -R g+w /srv/pkgrepo
+   sudo find /srv/pkgrepo -type d -exec chmod g+s {} +
+   sudo find /srv/pkgrepo -type d -exec setfacl -m d:g::rwx {} +
+   ```
+
+   `pkgs-sync` and `pkgs-remove` check the db's mode up front and name this
+   cause if it recurs; `getfacl` on a shared dir is the direct check.
 
    The db filename is what gives the staging repo its name — `repo-add`
    takes it from there, and so does pacman. Nothing inside the db records

@@ -266,6 +266,27 @@ pkgs_need_staging_write() {
         || die "$STAGING_DIR is not writable by $(id -un): run this as the build user (see README)"
 }
 
+# pkgs_need_db_write — fail early unless this account may write the staging
+# database. A separate question from the directory above, and the one that
+# actually bites: creating and deleting files is governed by the directory's
+# mode, but the db is modified in place, so there the file's own mode decides.
+#
+# repo-add(8) and repo-remove(8) both set `umask 0022` themselves, near the
+# top of the script, overriding the unit's UMask= and your login's alike. So
+# the db they write lands 0644 owned by whichever account ran them, and the
+# other account is locked out of a file it must modify, in a directory it can
+# still write. aur-build(1) checks `[[ -w $db_path ]]` and exits 13 before
+# building anything, reporting only a bare "permission denied" — hence this
+# check, which names the cause instead. The default ACL on the shared dirs
+# (README step 3) is what prevents the situation; this is what diagnoses a
+# setup that never got one.
+pkgs_need_db_write() {
+    local db
+    db=$(pkgs_db)
+    [[ ! -e $db || -w $db ]] || die \
+        "staging db is not writable by $(id -un): $db (mode $(stat -c %a "$db"), owner $(stat -c %U "$db")) — restore the shared-dir default ACL, see README step 3"
+}
+
 # pkgs_need_cmd CMD... — fail unless each command is on PATH.
 pkgs_need_cmd() {
     local c

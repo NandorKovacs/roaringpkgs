@@ -17,8 +17,12 @@ Group=pkgs
 Environment=PKGS_CONF=/etc/pkgs/pkgs.conf
 ExecStart=/opt/pkgs/bin/pkgs-sync
 
-# Keep everything the timer creates group-writable: the repos and the custom
+# Keep what the timer creates group-writable: the repos and the custom
 # PKGBUILD dirs are shared with your own account through the pkgs group.
+# Necessary but not sufficient, and deliberately kept anyway: repo-add and
+# repo-remove set `umask 0022` internally and ignore this, as does `sudo
+# makechrootpkg`. The default ACL on the shared dirs (README step 3) is what
+# covers those.
 UMask=0002
 
 # No sandboxing knobs on purpose: NoNewPrivileges= would break the build

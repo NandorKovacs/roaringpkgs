@@ -26,6 +26,7 @@ pkgs_need_cmd aur awk mktemp vercmp
 pkgs_log_open
 pkgs_lock -n
 pkgs_need_staging_write
+pkgs_need_db_write
 
 pkgs_log_run "$@"
 pkgs_log "transaction started"

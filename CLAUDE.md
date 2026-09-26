@@ -96,8 +96,15 @@ Privilege split — the timer is a **system** unit (`systemctl`, not
   as `sudo PKGDEST=… makechrootpkg …`, and a restricted rule (unlike a
   wheel `ALL` rule) does not imply `SETENV`. Don't drop it.
 - Both accounts are in group `pkgs`, and `STAGING_DIR`, `PUBLISH_DIR` and
-  the `CUSTOM_DIRS` trees are group-owned, setgid group-writable (`2775`).
-  Manual commands (`aur sync`, `aur build`, `pkgs-remove`, `pkgs-publish`)
+  the `CUSTOM_DIRS` trees are group-owned, setgid group-writable (`2775`),
+  and carry a default ACL (`setfacl -d -m g::rwx`). That ACL is load-bearing,
+  not belt-and-braces: `repo-add`/`repo-remove` set `umask 0022` internally
+  and `sudo makechrootpkg` resets it too, so `UMask=0002` never reaches the
+  files that matter. Without the ACL each account writes a 0644 db that locks
+  the other out, and `aur build` then refuses to run at all (it checks the db
+  for writability and exits 13). `pkgs_need_db_write` is the guard that names
+  this cause; do not weaken it to a directory-only check.
+- Manual commands (`aur sync`, `aur build`, `pkgs-remove`, `pkgs-publish`)
   run as the user, with ordinary password-prompting sudo; only the timer
   runs as `pkgsbuild`. The unit sets `UMask=0002`.
 - The gpg key and the ssh credentials stay with the user: `pkgsbuild` has
