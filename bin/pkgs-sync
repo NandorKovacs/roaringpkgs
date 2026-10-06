@@ -136,12 +136,16 @@ if [[ -s $tmp/vcs ]]; then
             :
         else
             # An AUR clone: refresh it so srcver sees new downstream commits.
+            # --discard, as aur-sync itself passes: makepkg rewrites pkgver=
+            # in the clone's PKGBUILD on every srcver/build, and that local
+            # edit makes the --ff-only merge refuse whenever the AUR commit
+            # touches PKGBUILD too.
             dir=$AURDEST/$pkgbase
             mkdir -p "$AURDEST"
             # Progress chatter on stdout stays discarded; git reports what
             # actually went wrong on stderr, so that is kept back and
             # replayed only on failure.
-            if ! (cd "$AURDEST" && pkgs_stderr_on_fail aur fetch -S "$pkgbase") >/dev/null; then
+            if ! (cd "$AURDEST" && pkgs_stderr_on_fail aur fetch -S --discard "$pkgbase") >/dev/null; then
                 pkgs_fail "aur fetch failed: $pkgbase"
             fi
         fi
